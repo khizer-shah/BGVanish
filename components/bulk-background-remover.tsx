@@ -11,7 +11,6 @@ import {
   Loader2,
   Lock,
   Play,
-  Sparkles,
   TimerReset,
   Trash2,
   UploadCloud,
@@ -50,8 +49,9 @@ type Summary = {
 };
 
 const MAX_FILES = 250;
-const CONCURRENCY_LIMIT = 3;
+const CONCURRENCY_LIMIT = 1;
 const ACCEPTED_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const PROGRESS_UPDATE_INTERVAL_MS = 300;
 
 const formatBytes = (bytes: number) => {
   if (bytes === 0) return "0 B";
@@ -80,6 +80,11 @@ const getErrorMessage = (error: unknown) => {
   return "The image could not be processed.";
 };
 
+const yieldToBrowser = () =>
+  new Promise<void>((resolve) => {
+    window.setTimeout(resolve, 0);
+  });
+
 export function BulkBackgroundRemover() {
   const [items, setItems] = useState<QueuedImage[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -92,6 +97,8 @@ export function BulkBackgroundRemover() {
   const [processingTotal, setProcessingTotal] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const itemsRef = useRef<QueuedImage[]>([]);
+  const progressUpdateRef = useRef(0);
+  const successfulItems = items.filter((item) => item.status === "success" && item.resultUrl);
 
   const queuedCount = items.filter((item) => item.status === "queued").length;
   const processableCount = items.filter(
@@ -121,6 +128,48 @@ export function BulkBackgroundRemover() {
       },
       ...current
     ]);
+  }, []);
+
+  const downloadSingle = useCallback((item: QueuedImage) => {
+    if (!item.resultUrl) return;
+    const anchor = document.createElement("a");
+    anchor.href = item.resultUrl;
+    anchor.download =
+      item.outputName || `${sanitizeFileName(item.file.name, "bgvanish-image")}-bgvanish.png`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  }, []);
+
+  const downloadAll = useCallback(async () => {
+    const successful = itemsRef.current.filter((item) => item.status === "success" && item.resultUrl);
+    if (!successful.length) return;
+
+    const zip = new JSZip();
+    await Promise.all(
+      successful.map(async (item, index) => {
+        if (!item.resultUrl) return;
+        const response = await fetch(item.resultUrl);
+        const blob = await response.blob();
+        const outputName =
+          item.outputName ||
+          `${String(index + 1).padStart(3, "0")}-${sanitizeFileName(
+            item.file.name,
+            `image-${index + 1}`
+          )}-bgvanish.png`;
+        zip.file(outputName, blob);
+      })
+    );
+
+    const zipBlob = await zip.generateAsync({ type: "blob" });
+    const url = URL.createObjectURL(zipBlob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `bgvanish-${new Date().toISOString().slice(0, 10)}.zip`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 500);
   }, []);
 
   const addFiles = useCallback(
@@ -208,6 +257,7 @@ export function BulkBackgroundRemover() {
     setProcessingTotal(batch.length);
     setActiveNames([]);
     setAssetProgress("Preparing on-device AI model...");
+    progressUpdateRef.current = 0;
     setLogs([]);
     setItems((current) =>
       current.map((item) =>
@@ -237,6 +287,7 @@ export function BulkBackgroundRemover() {
       const config: Config = {
         model: "isnet_fp16",
         device: "cpu",
+        rescale: true,
         output: {
           format: "image/png",
           quality: 1
@@ -246,20 +297,25 @@ export function BulkBackgroundRemover() {
           "https://staticimgly.com/@imgly/background-removal-data/1.7.0/dist/",
         progress: (key, current, total) => {
           if (total > 0) {
+            const now = performance.now();
             const percent = Math.round((current / total) * 100);
-            setAssetProgress(`Loading ${key} (${percent}%)`);
+            if (now - progressUpdateRef.current > PROGRESS_UPDATE_INTERVAL_MS || percent >= 100) {
+              progressUpdateRef.current = now;
+              setAssetProgress(`${key.replace("compute:", "").replace("fetch:", "Loading ")} (${percent}%)`);
+            }
           }
         }
       };
 
       const worker = async () => {
         while (cursor < batch.length) {
+          await yieldToBrowser();
           const item = batch[cursor];
           const taskNumber = cursor + 1;
           cursor += 1;
           const itemStartedAt = performance.now();
 
-          setActiveNames((current) => [...current, item.file.name]);
+          setActiveNames([item.file.name]);
           setItems((current) =>
             current.map((currentItem) =>
               currentItem.id === item.id ? { ...currentItem, status: "processing" } : currentItem
@@ -317,7 +373,8 @@ export function BulkBackgroundRemover() {
           } finally {
             completed += 1;
             setCompletedCount(completed);
-            setActiveNames((current) => current.filter((name) => name !== item.file.name));
+            setActiveNames([]);
+            await yieldToBrowser();
           }
         }
       };
@@ -389,107 +446,113 @@ export function BulkBackgroundRemover() {
   }, []);
 
   return (
-    <main className="relative min-h-screen px-4 py-5 text-white sm:px-6 lg:px-8">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-6">
-        <header className="flex flex-col gap-4 rounded-[20px] border border-white/10 bg-white/[0.035] px-5 py-5 backdrop-blur-2xl sm:flex-row sm:items-center sm:justify-between sm:px-6">
-          <div>
-            <div className="mb-2 flex items-center gap-3">
-              <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-cyan-300/30 bg-cyan-300/15 text-cyan-200 shadow-[0_0_24px_rgba(34,211,238,0.16)]">
-                <Sparkles className="h-5 w-5" aria-hidden="true" />
-              </div>
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-cyan-200/80">
-                  Private by design
-                </p>
-                <h1 className="text-3xl font-semibold tracking-normal text-white sm:text-4xl">
-                  BGVanish
-                </h1>
-              </div>
-            </div>
-            <p className="max-w-2xl text-sm leading-6 text-white/66 sm:text-base">
-              Bulk background removal for designers. Drop a batch, process on your device,
-              download transparent PNGs in one ZIP.
-            </p>
-          </div>
-          <nav className="flex flex-wrap items-center gap-2 text-sm text-white/64" aria-label="App facts">
-            <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-2">
+    <main className="relative min-h-screen overflow-hidden px-4 py-5 text-slate-950 sm:px-6 lg:px-8">
+      <div className="pointer-events-none absolute left-[-7rem] top-20 h-72 w-72 rounded-full bg-blue-200/50 blur-3xl" />
+      <div className="pointer-events-none absolute right-[-8rem] top-4 h-96 w-96 rounded-full bg-indigo-200/50 blur-3xl" />
+
+      <div className="relative mx-auto flex w-full max-w-6xl flex-col gap-8">
+        <header className="flex items-center justify-between py-2">
+          <div className="text-2xl font-extrabold tracking-normal text-slate-950">BGVanish</div>
+          <nav className="hidden items-center gap-2 text-sm font-medium text-slate-600 sm:flex">
+            <span className="rounded-full bg-white px-4 py-2 shadow-sm ring-1 ring-slate-200">
               250 images max
             </span>
-            <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-2">
-              No uploads
-            </span>
-            <span className="rounded-full border border-white/10 bg-white/[0.05] px-3 py-2">
-              WASM AI
+            <span className="rounded-full bg-white px-4 py-2 shadow-sm ring-1 ring-slate-200">
+              Private on-device
             </span>
           </nav>
         </header>
 
-        <section className="grid gap-6 xl:grid-cols-[minmax(0,1.05fr)_minmax(360px,0.95fr)]">
-          <div className="flex min-w-0 flex-col gap-6">
-            <div
-              role="button"
-              tabIndex={0}
-              onClick={() => inputRef.current?.click()}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  inputRef.current?.click();
-                }
-              }}
-              onDrop={onDrop}
-              onDragOver={(event) => {
-                event.preventDefault();
-                setIsDragging(true);
-              }}
-              onDragLeave={() => setIsDragging(false)}
-              className={clsx(
-                "glass-panel group flex min-h-[315px] cursor-pointer flex-col items-center justify-center rounded-[20px] border-2 border-dashed p-6 text-center sm:p-10",
-                isDragging
-                  ? "border-cyan-300/70 bg-cyan-300/[0.08] shadow-[0_0_34px_rgba(34,211,238,0.22)]"
-                  : "border-cyan-300/25"
-              )}
-            >
-              <input
-                ref={inputRef}
-                type="file"
-                accept="image/png,image/jpeg,image/jpg,image/webp"
-                multiple
-                className="hidden"
-                onChange={(event) => {
-                  if (event.target.files) addFiles(event.target.files);
-                  event.currentTarget.value = "";
-                }}
-              />
-              <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-[20px] border border-cyan-200/20 bg-cyan-300/10 text-cyan-100 shadow-[0_0_36px_rgba(34,211,238,0.16)] transition group-hover:scale-105">
-                <UploadCloud className="h-9 w-9" aria-hidden="true" />
-              </div>
-              <h2 className="max-w-xl text-2xl font-semibold tracking-normal text-white sm:text-3xl">
-                Drop images to vanish backgrounds
-              </h2>
-              <p className="mt-3 max-w-2xl text-sm leading-6 text-white/62 sm:text-base">
-                Select JPG, PNG, JPEG, or WebP files. Processing runs locally in your browser, so
-                large batches may take a few minutes.
-              </p>
-              <div className="mt-7 flex flex-wrap items-center justify-center gap-3 text-xs font-medium text-white/64">
-                <span className="rounded-full border border-white/10 bg-white/[0.06] px-3 py-2">
-                  Multi-file upload
-                </span>
-                <span className="rounded-full border border-white/10 bg-white/[0.06] px-3 py-2">
-                  Transparent PNG output
-                </span>
-                <span className="rounded-full border border-white/10 bg-white/[0.06] px-3 py-2">
-                  ZIP download
-                </span>
-              </div>
+        <section className="grid items-center gap-8 lg:grid-cols-[1fr_420px]">
+          <div className="mx-auto max-w-3xl text-center lg:mx-0 lg:text-left">
+            <p className="mb-4 inline-flex rounded-full bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700 ring-1 ring-blue-100">
+              Bulk background remover for designers
+            </p>
+            <h1 className="text-4xl font-extrabold leading-tight tracking-normal text-slate-950 sm:text-5xl lg:text-6xl">
+              Remove image backgrounds in your browser
+            </h1>
+            <p className="mx-auto mt-5 max-w-2xl text-base leading-7 text-slate-600 sm:text-lg lg:mx-0">
+              Upload JPG, PNG, JPEG, or WebP files and export transparent PNGs. Nothing is sent to
+              a server, so large batches may take a few minutes on your device.
+            </p>
+            <div className="mt-6 flex flex-wrap justify-center gap-3 text-sm text-slate-500 lg:justify-start">
+              <span className="inline-flex items-center gap-2 rounded-full bg-white px-4 py-2 shadow-sm ring-1 ring-slate-200">
+                <CheckCircle2 className="h-4 w-4 text-blue-600" aria-hidden="true" />
+                Transparent PNGs
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-full bg-white px-4 py-2 shadow-sm ring-1 ring-slate-200">
+                <FileArchive className="h-4 w-4 text-blue-600" aria-hidden="true" />
+                ZIP or single downloads
+              </span>
+              <span className="inline-flex items-center gap-2 rounded-full bg-white px-4 py-2 shadow-sm ring-1 ring-slate-200">
+                <Lock className="h-4 w-4 text-blue-600" aria-hidden="true" />
+                No uploads
+              </span>
             </div>
+          </div>
 
-            <section className="glass-panel rounded-[20px] p-4 sm:p-5">
+          <div
+            role="button"
+            tabIndex={0}
+            onClick={() => inputRef.current?.click()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                inputRef.current?.click();
+              }
+            }}
+            onDrop={onDrop}
+            onDragOver={(event) => {
+              event.preventDefault();
+              setIsDragging(true);
+            }}
+            onDragLeave={() => setIsDragging(false)}
+            className={clsx(
+              "upload-card group flex min-h-[360px] cursor-pointer flex-col items-center justify-center rounded-[32px] border-2 border-dashed bg-white p-7 text-center shadow-[0_18px_60px_rgba(15,23,42,0.12)] transition sm:p-9",
+              isDragging
+                ? "border-blue-500 bg-blue-50 shadow-[0_24px_70px_rgba(37,99,235,0.22)]"
+                : "border-blue-200 hover:border-blue-400 hover:shadow-[0_24px_70px_rgba(37,99,235,0.16)]"
+            )}
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/jpg,image/webp"
+              multiple
+              className="hidden"
+              onChange={(event) => {
+                if (event.target.files) addFiles(event.target.files);
+                event.currentTarget.value = "";
+              }}
+            />
+            <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-blue-50 text-blue-600 ring-1 ring-blue-100 transition group-hover:scale-105">
+              <UploadCloud className="h-10 w-10" aria-hidden="true" />
+            </div>
+            <h2 className="text-2xl font-extrabold tracking-normal text-slate-950">
+              Upload images
+            </h2>
+            <p className="mt-3 max-w-sm text-sm leading-6 text-slate-500">
+              Drag and drop a batch here or click to browse. Up to {MAX_FILES} images.
+            </p>
+            <button
+              type="button"
+              className="mt-7 rounded-full bg-blue-600 px-8 py-4 text-base font-bold text-white shadow-[0_14px_34px_rgba(37,99,235,0.28)] transition hover:bg-blue-700"
+            >
+              Upload Image
+            </button>
+            <p className="mt-4 text-xs text-slate-400">Supports JPG, PNG, JPEG, WebP</p>
+          </div>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="flex min-w-0 flex-col gap-6">
+            <section className="soft-card rounded-[28px] p-4 sm:p-5">
               <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <h2 className="text-lg font-semibold text-white">Queued files</h2>
-                  <p className="text-sm text-white/55">
+                  <h2 className="text-xl font-extrabold text-slate-950">Queued files</h2>
+                  <p className="text-sm text-slate-500">
                     {items.length
-                      ? `${items.length}/${MAX_FILES} files · ${formatBytes(totalSize)} selected`
+                      ? `${items.length}/${MAX_FILES} files - ${formatBytes(totalSize)} selected`
                       : "Add images to start a batch."}
                   </p>
                 </div>
@@ -498,7 +561,7 @@ export function BulkBackgroundRemover() {
                     type="button"
                     onClick={() => inputRef.current?.click()}
                     disabled={isProcessing || items.length >= MAX_FILES}
-                    className="glass-button inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm text-white/86 disabled:cursor-not-allowed disabled:opacity-45"
+                    className="secondary-button inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     <UploadCloud className="h-4 w-4" aria-hidden="true" />
                     Add
@@ -507,7 +570,7 @@ export function BulkBackgroundRemover() {
                     type="button"
                     onClick={clearAll}
                     disabled={isProcessing || items.length === 0}
-                    className="glass-button inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm text-white/70 disabled:cursor-not-allowed disabled:opacity-45"
+                    className="secondary-button inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     <Trash2 className="h-4 w-4" aria-hidden="true" />
                     Clear All
@@ -516,24 +579,23 @@ export function BulkBackgroundRemover() {
               </div>
 
               {items.length === 0 ? (
-                <div className="flex min-h-[230px] flex-col items-center justify-center rounded-2xl border border-white/10 bg-white/[0.025] px-5 text-center">
-                  <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] text-cyan-100">
+                <div className="flex min-h-[220px] flex-col items-center justify-center rounded-[24px] bg-slate-50 px-5 text-center ring-1 ring-slate-100">
+                  <div className="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-white text-blue-600 shadow-sm ring-1 ring-slate-200">
                     <ImageIcon className="h-8 w-8" aria-hidden="true" />
                   </div>
-                  <p className="text-base font-medium text-white">Your queue is clear.</p>
-                  <p className="mt-2 max-w-sm text-sm leading-6 text-white/55">
-                    Drag in product shots, profile images, mockup exports, or browse from your
-                    device.
+                  <p className="text-base font-bold text-slate-950">No images yet</p>
+                  <p className="mt-2 max-w-sm text-sm leading-6 text-slate-500">
+                    Upload product shots, portraits, mockups, or exports from your design tool.
                   </p>
                 </div>
               ) : (
-                <div className="custom-scrollbar grid max-h-[390px] grid-cols-2 gap-3 overflow-y-auto pr-1 sm:grid-cols-3 lg:grid-cols-4">
+                <div className="custom-scrollbar grid max-h-[430px] grid-cols-2 gap-3 overflow-y-auto pr-1 sm:grid-cols-3 xl:grid-cols-4">
                   {items.map((item) => (
                     <article
                       key={item.id}
-                      className="group relative overflow-hidden rounded-2xl border border-white/10 bg-white/[0.05]"
+                      className="group relative overflow-hidden rounded-[22px] bg-white shadow-sm ring-1 ring-slate-200"
                     >
-                      <div className="aspect-square overflow-hidden bg-black/30">
+                      <div className="aspect-square overflow-hidden bg-slate-100">
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
                           src={item.previewUrl}
@@ -546,15 +608,15 @@ export function BulkBackgroundRemover() {
                         aria-label={`Remove ${item.file.name}`}
                         onClick={() => removeItem(item.id)}
                         disabled={isProcessing}
-                        className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-black/50 text-white/80 backdrop-blur-md transition hover:border-cyan-200/40 hover:text-cyan-100 disabled:cursor-not-allowed disabled:opacity-40"
+                        className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-full bg-white/95 text-slate-600 shadow-sm ring-1 ring-slate-200 transition hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         <X className="h-4 w-4" aria-hidden="true" />
                       </button>
                       <div className="p-3">
-                        <p className="truncate text-sm font-medium text-white/90" title={item.file.name}>
+                        <p className="truncate text-sm font-semibold text-slate-800" title={item.file.name}>
                           {item.file.name}
                         </p>
-                        <div className="mt-2 flex items-center justify-between gap-2 text-xs text-white/48">
+                        <div className="mt-2 flex items-center justify-between gap-2 text-xs text-slate-400">
                           <span>{formatBytes(item.file.size)}</span>
                           <StatusPill status={item.status} />
                         </div>
@@ -564,55 +626,111 @@ export function BulkBackgroundRemover() {
                 </div>
               )}
             </section>
+
+            <section className="soft-card rounded-[28px] p-4 sm:p-5">
+              <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 className="text-xl font-extrabold text-slate-950">Removed backgrounds</h2>
+                  <p className="text-sm text-slate-500">
+                    Download each transparent PNG or use the automatic ZIP after processing.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={downloadAll}
+                  disabled={!successfulItems.length}
+                  className="secondary-button inline-flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  <FileArchive className="h-4 w-4" aria-hidden="true" />
+                  Download All
+                </button>
+              </div>
+              {resultItems.length === 0 ? (
+                <div className="rounded-[24px] bg-slate-50 p-6 text-sm leading-6 text-slate-500 ring-1 ring-slate-100">
+                  Results will appear here with a checkerboard behind transparent output.
+                </div>
+              ) : (
+                <div className="custom-scrollbar max-h-[620px] space-y-4 overflow-y-auto pr-1">
+                  {resultItems.map((item) => (
+                    <article key={item.id} className="rounded-[24px] bg-white p-3 shadow-sm ring-1 ring-slate-200">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-bold text-slate-800" title={item.file.name}>
+                            {item.file.name}
+                          </p>
+                          <p className="text-xs text-slate-400">
+                            {item.durationMs ? formatDuration(item.durationMs) : "Waiting"}
+                          </p>
+                        </div>
+                        <StatusPill status={item.status} />
+                      </div>
+                      {item.status === "failed" ? (
+                        <div className="flex items-start gap-2 rounded-2xl bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-100">
+                          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                          <span>{item.error || "Could not process this image."}</span>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="grid grid-cols-2 gap-3">
+                            <PreviewTile label="Original" src={item.previewUrl} alt={`${item.file.name} before`} />
+                            <PreviewTile
+                              label="Removed"
+                              src={item.resultUrl}
+                              alt={`${item.file.name} after`}
+                              checkerboard
+                              onDownload={() => downloadSingle(item)}
+                            />
+                          </div>
+                        </>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
           </div>
 
           <aside className="flex min-w-0 flex-col gap-6">
-            <section className="glass-panel rounded-[20px] p-5 sm:p-6">
-              <div className="mb-5 flex items-start justify-between gap-4">
-                <div>
-                  <p className="mb-2 inline-flex items-center gap-2 rounded-full border border-cyan-200/20 bg-cyan-300/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-100">
-                    <Lock className="h-3.5 w-3.5" aria-hidden="true" />
-                    On-device
-                  </p>
-                  <h2 className="text-2xl font-semibold text-white">Batch processor</h2>
-                  <p className="mt-2 text-sm leading-6 text-white/58">
-                    Runs up to {CONCURRENCY_LIMIT} images at a time to keep the tab responsive while
-                    the model works locally.
-                  </p>
-                </div>
-                <div className="hidden h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.06] text-cyan-100 sm:flex">
-                  <FileArchive className="h-7 w-7" aria-hidden="true" />
-                </div>
+            <section className="soft-card rounded-[28px] p-5 sm:p-6">
+              <div className="mb-5">
+                <p className="mb-2 inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1 text-xs font-bold uppercase tracking-[0.14em] text-blue-700 ring-1 ring-blue-100">
+                  <Lock className="h-3.5 w-3.5" aria-hidden="true" />
+                  On-device
+                </p>
+                <h2 className="text-2xl font-extrabold text-slate-950">Process batch</h2>
+                <p className="mt-2 text-sm leading-6 text-slate-500">
+                  Processes one high-quality image at a time to keep the browser responsive.
+                </p>
               </div>
 
               <button
                 type="button"
                 onClick={startProcessing}
                 disabled={!processableCount || isProcessing}
-                className="flex w-full items-center justify-center gap-3 rounded-full bg-cyan-300 px-5 py-4 text-base font-semibold text-slate-950 shadow-[0_0_34px_rgba(34,211,238,0.22)] transition hover:bg-cyan-200 hover:shadow-[0_0_40px_rgba(34,211,238,0.32)] disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-white/40 disabled:shadow-none"
+                className="flex w-full items-center justify-center gap-3 rounded-full bg-blue-600 px-5 py-4 text-base font-bold text-white shadow-[0_14px_34px_rgba(37,99,235,0.28)] transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none"
               >
                 {isProcessing ? (
                   <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
                 ) : (
-                  <Play className="h-5 w-5 fill-slate-950" aria-hidden="true" />
+                  <Play className="h-5 w-5 fill-white" aria-hidden="true" />
                 )}
                 {isProcessing ? "Removing backgrounds..." : "Remove Backgrounds"}
               </button>
 
               <div className="mt-6">
                 <div className="mb-2 flex items-center justify-between text-sm">
-                  <span className="font-medium text-white/82">
+                  <span className="font-semibold text-slate-700">
                     {completedCount}/{progressTotal || 0} completed
                   </span>
-                  <span className="text-cyan-100">{progressPercent}%</span>
+                  <span className="font-bold text-blue-700">{progressPercent}%</span>
                 </div>
-                <div className="h-3 overflow-hidden rounded-full border border-white/10 bg-white/[0.06]">
+                <div className="h-3 overflow-hidden rounded-full bg-slate-100">
                   <div
-                    className="h-full rounded-full bg-cyan-300 shadow-[0_0_20px_rgba(34,211,238,0.55)] transition-all duration-300"
+                    className="h-full rounded-full bg-blue-600 transition-all duration-300"
                     style={{ width: `${progressPercent}%` }}
                   />
                 </div>
-                <p className="mt-3 min-h-10 text-sm leading-5 text-white/56">
+                <p className="mt-3 min-h-10 text-sm leading-5 text-slate-500">
                   {activeNames.length
                     ? `Processing ${activeNames.join(", ")}`
                     : assetProgress || "Ready for the next batch."}
@@ -627,17 +745,17 @@ export function BulkBackgroundRemover() {
             </section>
 
             {summary && (
-              <section className="glass-panel rounded-[20px] p-5 sm:p-6">
+              <section className="soft-card rounded-[28px] p-5 sm:p-6">
                 <div className="mb-4 flex items-center gap-3">
-                  <div className="flex h-11 w-11 items-center justify-center rounded-2xl border border-cyan-200/25 bg-cyan-300/10 text-cyan-100">
+                  <div className="flex h-11 w-11 items-center justify-center rounded-full bg-green-50 text-green-600 ring-1 ring-green-100">
                     <CheckCircle2 className="h-6 w-6" aria-hidden="true" />
                   </div>
                   <div>
-                    <h2 className="text-xl font-semibold text-white">Batch summary</h2>
-                    <p className="text-sm text-white/55">ZIP download starts automatically.</p>
+                    <h2 className="text-xl font-extrabold text-slate-950">Batch summary</h2>
+                    <p className="text-sm text-slate-500">ZIP download starts automatically.</p>
                   </div>
                 </div>
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <div className="grid grid-cols-2 gap-3">
                   <Metric label="Total" value={summary.total} />
                   <Metric label="Success" value={summary.success} />
                   <Metric label="Failed" value={summary.failed} />
@@ -646,86 +764,34 @@ export function BulkBackgroundRemover() {
               </section>
             )}
 
-            <section className="glass-panel rounded-[20px] p-5 sm:p-6">
-              <div className="mb-4 flex items-center justify-between">
-                <div>
-                  <h2 className="text-xl font-semibold text-white">Live previews</h2>
-                  <p className="text-sm text-white/55">Before and transparent after views appear as files finish.</p>
-                </div>
-                <Download className="h-5 w-5 text-cyan-100/80" aria-hidden="true" />
-              </div>
-              {resultItems.length === 0 ? (
-                <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-sm leading-6 text-white/56">
-                  Finished images will show here with a checkerboard behind the transparent PNG.
-                </div>
-              ) : (
-                <div className="custom-scrollbar max-h-[520px] space-y-3 overflow-y-auto pr-1">
-                  {resultItems.map((item) => (
-                    <article key={item.id} className="rounded-2xl border border-white/10 bg-white/[0.045] p-3">
-                      <div className="mb-3 flex items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <p className="truncate text-sm font-medium text-white/88" title={item.file.name}>
-                            {item.file.name}
-                          </p>
-                          <p className="text-xs text-white/45">
-                            {item.durationMs ? formatDuration(item.durationMs) : "Waiting"}
-                          </p>
-                        </div>
-                        <StatusPill status={item.status} />
-                      </div>
-                      {item.status === "failed" ? (
-                        <div className="flex items-start gap-2 rounded-xl border border-red-300/20 bg-red-500/10 p-3 text-sm text-red-100/86">
-                          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-                          <span>{item.error || "Could not process this image."}</span>
-                        </div>
-                      ) : (
-                        <div className="grid grid-cols-2 gap-3">
-                          <PreviewTile label="Before" src={item.previewUrl} alt={`${item.file.name} before`} />
-                          <PreviewTile
-                            label="After"
-                            src={item.resultUrl}
-                            alt={`${item.file.name} after`}
-                            checkerboard
-                          />
-                        </div>
-                      )}
-                    </article>
-                  ))}
-                </div>
-              )}
-            </section>
-
-            <details className="glass-panel group rounded-[20px] p-5 sm:p-6">
+            <details className="soft-card group rounded-[28px] p-5 sm:p-6">
               <summary className="flex cursor-pointer list-none items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-xl font-semibold text-white">Processing log</h2>
-                  <p className="text-sm text-white/55">{logs.length} events recorded</p>
+                  <h2 className="text-xl font-extrabold text-slate-950">Processing log</h2>
+                  <p className="text-sm text-slate-500">{logs.length} events recorded</p>
                 </div>
-                <ChevronDown className="h-5 w-5 text-white/50 transition group-open:rotate-180" aria-hidden="true" />
+                <ChevronDown className="h-5 w-5 text-slate-400 transition group-open:rotate-180" aria-hidden="true" />
               </summary>
               <div className="custom-scrollbar mt-5 max-h-80 space-y-2 overflow-y-auto pr-1">
                 {logs.length === 0 ? (
-                  <p className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-sm text-white/55">
+                  <p className="rounded-2xl bg-slate-50 p-4 text-sm text-slate-500 ring-1 ring-slate-100">
                     Skips, corrupt files, and completed exports will be listed here.
                   </p>
                 ) : (
                   logs.map((log) => (
-                    <div
-                      key={log.id}
-                      className="rounded-2xl border border-white/10 bg-white/[0.04] p-3 text-sm"
-                    >
+                    <div key={log.id} className="rounded-2xl bg-slate-50 p-3 text-sm ring-1 ring-slate-100">
                       <div className="mb-1 flex items-center justify-between gap-3">
-                        <span className="truncate font-medium text-white/86" title={log.fileName}>
+                        <span className="truncate font-semibold text-slate-800" title={log.fileName}>
                           {log.fileName}
                         </span>
-                        <span className="shrink-0 text-xs text-white/42">{log.time}</span>
+                        <span className="shrink-0 text-xs text-slate-400">{log.time}</span>
                       </div>
                       <p
                         className={clsx(
                           "leading-5",
-                          log.status === "success" && "text-cyan-100/78",
-                          log.status === "failed" && "text-red-100/78",
-                          log.status === "info" && "text-white/58"
+                          log.status === "success" && "text-green-700",
+                          log.status === "failed" && "text-red-700",
+                          log.status === "info" && "text-slate-500"
                         )}
                       >
                         {log.message}
@@ -744,25 +810,25 @@ export function BulkBackgroundRemover() {
 
 function Metric({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="rounded-2xl border border-white/10 bg-white/[0.045] p-3">
-      <p className="text-xs uppercase tracking-[0.16em] text-white/42">{label}</p>
-      <p className="mt-1 truncate text-lg font-semibold text-white">{value}</p>
+    <div className="rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-100">
+      <p className="text-xs font-bold uppercase tracking-[0.12em] text-slate-400">{label}</p>
+      <p className="mt-1 truncate text-lg font-extrabold text-slate-950">{value}</p>
     </div>
   );
 }
 
 function StatusPill({ status }: { status: QueueStatus }) {
   const styles = {
-    queued: "border-white/10 bg-white/[0.06] text-white/54",
-    processing: "border-cyan-200/30 bg-cyan-300/10 text-cyan-100",
-    success: "border-emerald-200/25 bg-emerald-400/10 text-emerald-100",
-    failed: "border-red-200/25 bg-red-400/10 text-red-100"
+    queued: "bg-slate-100 text-slate-500 ring-slate-200",
+    processing: "bg-blue-50 text-blue-700 ring-blue-100",
+    success: "bg-green-50 text-green-700 ring-green-100",
+    failed: "bg-red-50 text-red-700 ring-red-100"
   };
 
   return (
     <span
       className={clsx(
-        "inline-flex shrink-0 items-center gap-1 rounded-full border px-2 py-1 text-[11px] font-medium capitalize",
+        "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-1 text-[11px] font-bold capitalize ring-1",
         styles[status]
       )}
     >
@@ -778,26 +844,46 @@ function PreviewTile({
   label,
   src,
   alt,
-  checkerboard = false
+  checkerboard = false,
+  onDownload
 }: {
   label: string;
   src?: string;
   alt: string;
   checkerboard?: boolean;
+  onDownload?: () => void;
 }) {
   return (
-    <div className={clsx("relative aspect-square overflow-hidden rounded-xl border border-white/10", checkerboard && "checkerboard")}>
+    <div
+      className={clsx(
+        "relative aspect-square overflow-hidden rounded-2xl bg-slate-100 ring-1 ring-slate-200",
+        checkerboard && "checkerboard"
+      )}
+    >
       {src ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img src={src} alt={alt} className="h-full w-full object-contain" />
       ) : (
-        <div className="flex h-full items-center justify-center text-white/36">
+        <div className="flex h-full items-center justify-center text-slate-300">
           <TimerReset className="h-6 w-6" aria-hidden="true" />
         </div>
       )}
-      <span className="absolute left-2 top-2 rounded-full border border-white/10 bg-black/45 px-2 py-1 text-[11px] font-medium text-white/78 backdrop-blur-md">
+      <span className="absolute left-2 top-2 rounded-full bg-white/95 px-2 py-1 text-[11px] font-bold text-slate-600 shadow-sm ring-1 ring-slate-200">
         {label}
       </span>
+      {onDownload && src && (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onDownload();
+          }}
+          aria-label={`Download ${alt}`}
+          className="absolute right-2 top-2 flex h-9 w-9 items-center justify-center rounded-full bg-blue-600 text-white shadow-lg shadow-blue-600/20 ring-1 ring-blue-500 transition hover:bg-blue-700"
+        >
+          <Download className="h-4 w-4" aria-hidden="true" />
+        </button>
+      )}
     </div>
   );
 }
